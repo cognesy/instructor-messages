@@ -2,13 +2,10 @@
 
 namespace Cognesy\Messages\MessageStore;
 
-use Cognesy\Messages\MessageStore\Traits\MessageStore\HandlesAccess;
-use Cognesy\Messages\MessageStore\Traits\MessageStore\HandlesConversion;
-use Cognesy\Messages\MessageStore\Traits\MessageStore\HandlesCreation;
-use Cognesy\Messages\MessageStore\Traits\MessageStore\HandlesMutation;
-use Cognesy\Messages\MessageStore\Traits\MessageStore\HandlesParameters;
-use Cognesy\Messages\MessageStore\Traits\MessageStore\HandlesReordering;
-use Cognesy\Messages\MessageStore\Traits\MessageStore\HandlesTransformation;
+use Cognesy\Messages\Messages;
+use Cognesy\Messages\MessageStore\Collections\Sections;
+use Cognesy\Messages\MessageStore\Operators\ParameterOperator;
+use Cognesy\Messages\MessageStore\Operators\SectionOperator;
 
 /**
  * MessageStore represents a library of message sequences with multiple sections and messages.
@@ -21,14 +18,6 @@ use Cognesy\Messages\MessageStore\Traits\MessageStore\HandlesTransformation;
  */
 final readonly class MessageStore
 {
-    use HandlesAccess;
-    use HandlesParameters;
-    use HandlesConversion;
-    use HandlesCreation;
-    use HandlesMutation;
-    use HandlesReordering;
-    use HandlesTransformation;
-
     public Sections $sections;
     public MessageStoreParameters $parameters;
 
@@ -40,7 +29,94 @@ final readonly class MessageStore
         $this->parameters = $parameters ?? new MessageStoreParameters();
     }
 
-    public static function fromSections(Section ...$sections): static {
-        return new static(new Sections(...$sections));
+    // CONSTRUCTORS ///////////////////////////////////////////
+
+    public static function empty() : MessageStore {
+        return new MessageStore();
+    }
+
+    public static function fromSections(Section ...$sections): MessageStore {
+        return new MessageStore(new Sections(...$sections));
+    }
+
+    public static function fromMessages(Messages $messages, string $section = 'messages') : MessageStore {
+        $sections = new Sections((new Section($section))->appendMessages($messages));
+        return new MessageStore($sections);
+    }
+
+    public static function fromArray(array $data) : MessageStore {
+        $sections = isset($data['sections']) ? Sections::fromArray($data['sections']) : new Sections();
+        $parameters = isset($data['parameters']) ? MessageStoreParameters::fromArray($data['parameters']) : new MessageStoreParameters();
+        return new MessageStore(
+            sections: $sections,
+            parameters: $parameters,
+        );
+    }
+
+    // MUTATORS ///////////////////////////////////////////////
+
+    public function withSection(string $name): MessageStore {
+        if ($this->section($name)->exists()) {
+            return $this;
+        }
+
+        $newSection = new Section($name);
+        $newSections = $this->sections->add($newSection);
+        return new MessageStore(
+            sections: $newSections,
+            parameters: $this->parameters,
+        );
+    }
+
+    // ACCESSORS ////////////////////////////////////////////////
+
+    public function sections() : Sections {
+        return $this->sections;
+    }
+
+    // CONVERSIONS and TRANSFORMATIONS //////////////////////////
+
+    /**
+     * @param string|string[] $sections
+     */
+    public function select(string|array $sections = []) : MessageStore {
+        $names = match (true) {
+            empty($sections) => $this->sections->map(fn($section) => $section->name),
+            is_string($sections) => [$sections],
+            is_array($sections) => $sections,
+        };
+        $selectedSections = [];
+        foreach ($names as $sectionName) {
+            if ($this->section($sectionName)->exists()) {
+                $selectedSections[] = $this->section($sectionName)->get();
+            }
+        }
+        return new MessageStore(
+            sections: new Sections(...$selectedSections),
+            parameters: $this->parameters,
+        );
+    }
+
+    public function toMessages() : Messages {
+        return $this->sections->toMessages();
+    }
+
+    /**
+     * @return array<string,array>
+     */
+    public function toArray() : array {
+        return $this->toMessages()->toArray();
+    }
+
+    public function toString() : string {
+        return $this->toMessages()->toString();
+    }
+
+    public function section(string $name) : SectionOperator {
+        return new SectionOperator($this, $name);
+    }
+
+    public function parameters(): ParameterOperator {
+        return new ParameterOperator($this);
     }
 }

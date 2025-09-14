@@ -1,8 +1,9 @@
 <?php declare(strict_types=1);
 
-namespace Cognesy\Messages\MessageStore;
+namespace Cognesy\Messages\MessageStore\Collections;
 
 use Cognesy\Messages\Messages;
+use Cognesy\Messages\MessageStore\Section;
 use InvalidArgumentException;
 
 final readonly class Sections
@@ -13,6 +14,10 @@ final readonly class Sections
         $this->sections = $sections;
     }
 
+    // CONSTRUCTORS /////////////////////////////////////////////
+
+    // MUTATORS /////////////////////////////////////////////////
+
     public function add(Section ...$sections): Sections {
         foreach ($sections as $section) {
             if ($this->has($section->name)) {
@@ -21,6 +26,12 @@ final readonly class Sections
         }
         return new Sections(...array_merge($this->sections, $sections));
     }
+
+    public function remove(callable $callback): Sections {
+        return $this->filter(fn(Section $s) => !$callback($s));
+    }
+
+    // ACCESSORS ////////////////////////////////////////////////
 
     public function has(string $name): bool {
         foreach ($this->sections as $section) {
@@ -40,22 +51,6 @@ final readonly class Sections
         return null;
     }
 
-    public function remove(callable $callback): Sections {
-        return $this->filter(fn(Section $s) => !$callback($s));
-    }
-
-    public function map(callable $callback): array {
-        return array_map($callback, $this->sections);
-    }
-
-    public function filter(callable $callback): Sections {
-        return new Sections(...array_filter($this->sections, $callback));
-    }
-
-    public function reduce(callable $callback, mixed $initial = null): mixed {
-        return array_reduce($this->sections, $callback, $initial);
-    }
-
     public function all(): array {
         return $this->sections;
     }
@@ -68,6 +63,24 @@ final readonly class Sections
 
     public function count(): int {
         return count($this->sections);
+    }
+
+    public function names(): array {
+        return $this->map(fn(Section $section) => $section->name);
+    }
+
+    // CONVERSIONS and TRANSFORMATIONS //////////////////////////
+
+    public function map(callable $callback): array {
+        return array_map($callback, $this->sections);
+    }
+
+    public function filter(callable $callback): Sections {
+        return new Sections(...array_filter($this->sections, $callback));
+    }
+
+    public function reduce(callable $callback, mixed $initial = null): mixed {
+        return array_reduce($this->sections, $callback, $initial);
     }
 
     public function toMessages(): Messages {
