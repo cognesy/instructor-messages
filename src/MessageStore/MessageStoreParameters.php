@@ -12,6 +12,10 @@ final readonly class MessageStoreParameters
 
     // CONSTRUCTORS /////////////////////////////////////////////
 
+    public static function fromArray(array $parameters): self {
+        return new self($parameters);
+    }
+
     // ACCESSORS ////////////////////////////////////////////////
 
     public function has(string $name) : bool {
@@ -58,6 +62,9 @@ final readonly class MessageStoreParameters
         return $this->parameters;
     }
 
+    /**
+     * @param callable(mixed): bool $condition
+     */
     public function filter(array $names, callable $condition) : MessageStoreParameters {
         return new MessageStoreParameters(array_filter(
             array: $this->parameters,

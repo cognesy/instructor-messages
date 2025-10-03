@@ -15,7 +15,6 @@ final readonly class Messages
     /** @var Message[] $messages */
     private array $messages;
 
-    /** @param Message[] $messages */
     public function __construct(Message ...$messages) {
         $this->messages = $messages;
     }
@@ -29,7 +28,9 @@ final readonly class Messages
         return new Messages(Message::fromString($content, $role));
     }
 
-    /** @param array<string, string|array> $messages */
+    /**
+     * @param list<string|array<array-key, mixed>> $messages List of messages (strings or arrays with role/content)
+     */
     static public function fromArray(array $messages) : Messages {
         $newMessages = [];
         foreach ($messages as $message) {
@@ -210,6 +211,9 @@ final readonly class Messages
 
     // CONVERSION / TRANSFORMATION /////////////////////////////////////////
 
+    /**
+     * @param callable(array): string|null $renderer
+     */
     public static function asString(
         array $messages,
         string $separator = "\n",
@@ -221,7 +225,7 @@ final readonly class Messages
                 continue;
             }
             $rendered = match(true) {
-                !is_null($renderer) => $renderer($message),
+                $renderer !== null => $renderer($message),
                 default => match(true) {
                     Message::becomesComposite($message) => throw new RuntimeException('Array contains composite messages, cannot be converted to string.'),
                     default => Message::fromAny($message)->toString() . $separator,
@@ -233,7 +237,7 @@ final readonly class Messages
     }
 
     /**
-     * @return array<string, string|array>
+     * @return list<array<array-key, mixed>>
      */
     public function toArray() : array {
         $result = [];
@@ -431,21 +435,35 @@ final readonly class Messages
         return !$this->isEmpty();
     }
 
+    /**
+     * @template T
+     * @param callable(T, Message): T $callback
+     * @param T $initial
+     * @return T
+     */
     public function reduce(callable $callback, mixed $initial = null) : mixed {
         return array_reduce($this->messages, $callback, $initial);
     }
 
+    /**
+     * @template T
+     * @param callable(Message): T $callback
+     * @return array<T>
+     */
     public function map(callable $callback) : array {
         return array_map($callback, $this->messages);
     }
 
+    /**
+     * @param callable(Message): bool|null $callback
+     */
     public function filter(?callable $callback = null) : Messages {
         $filteredMessages = [];
         foreach ($this->messages as $message) {
             if ($message->isEmpty()) {
                 continue;
             }
-            if ($callback($message)) {
+            if ($callback !== null && $callback($message)) {
                 $filteredMessages[] = $message->clone();
             }
         }
@@ -457,11 +475,19 @@ final readonly class Messages
     }
 
     public function firstRole() : MessageRole {
-        return $this->first()?->role();
+        $first = $this->first();
+        if (!($first instanceof Message)) {
+            throw new \RuntimeException('Cannot get role of first message - no messages available');
+        }
+        return $first->role();
     }
 
     public function lastRole() : MessageRole {
-        return $this->last()?->role();
+        $last = $this->last();
+        if (!($last instanceof Message)) {
+            throw new \RuntimeException('Cannot get role of last message - no messages available');
+        }
+        return $last->role();
     }
 
     /**  @return Message[] */
