@@ -6,7 +6,7 @@ namespace Cognesy\Messages\Tests\Fixtures;
 use Cognesy\Messages\Contracts\CanProvideMessage;
 use Cognesy\Messages\Message;
 
-class MockMessageProvider implements CanProvideMessage {
+class StubMessageProvider implements CanProvideMessage {
     public function toMessage(): Message {
         return new Message('user', 'From message provider');
     }
