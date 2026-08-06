@@ -138,7 +138,11 @@ final readonly class ContentPart
     }
 
     public function toString(): string {
-        return $this->fields['text'] ?? "";
+        // Non-string 'text' collapses to '' rather than throwing: this runs on provider
+        // serialization paths, where a TypeError is worse than an empty part, and
+        // isEmpty()/withoutEmpty() already prune empties downstream. hasText() is the
+        // single source of truth for "has usable text".
+        return $this->hasText() ? $this->fields['text'] : "";
     }
 
     // INTERNAL /////////////////////////////////////////////
@@ -151,6 +155,10 @@ final readonly class ContentPart
     }
 
     private static function normalizeType(string $type): string {
-        return ContentType::tryFrom($type)?->value ?? $type;
+        $contentType = ContentType::tryFrom($type);
+        return match ($contentType) {
+            null => $type,
+            default => $contentType->value,
+        };
     }
 }

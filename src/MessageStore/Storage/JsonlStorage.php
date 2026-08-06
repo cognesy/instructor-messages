@@ -17,18 +17,50 @@ use RuntimeException;
 /**
  * JSONL file-based storage (Pi-Mono style).
  *
- * Append-only format where each line is a JSON entry.
- * Supports session trees via parentId chains in messages.
+ * One JSON entry per line. Session trees are expressed as parentId chains in messages,
+ * so a single file can hold several branches.
  *
  * File format:
  * - Line 1: Session header {"type":"session","id":"...","createdAt":"..."}
  * - Lines 2+: Entries {"type":"message"|"label","id":"...","parentId":"...","data":{...}}
+ *
+ * Two write paths, with deliberately different contracts:
+ *
+ * - append() is append-only: it adds one entry and never touches what is already in the
+ *   file. Combined with navigateTo(), which moves the leaf appends attach to, it is how a
+ *   session grows, branches included.
+ * - save() REPLACES the session with exactly the passed MessageStore - it rewrites the
+ *   file, so any message not present in that store is gone, branches included. That is
+ *   the same contract InMemoryStorage::save() implements, and load() returns every
+ *   message in the session, so the ordinary load -> mutate -> save cycle is lossless.
+ *   Saving a store assembled from a SUBSET of a session (a single path, a filtered set
+ *   of sections) prunes the session to that subset - by design, but rarely what a caller
+ *   wants. Reach for append() when the intent is additive.
+ *
+ * save() is atomic: the new contents are written to a temp file in the same directory and
+ * renamed into place, so an interrupted save leaves the previous file untouched rather
+ * than truncated. It was previously a truncate-then-append-per-message sequence, where a
+ * throw partway through destroyed the session and then reported failure over lost data.
+ *
+ * Reads are lenient, writes are strict. Message and MessageId validate on construction,
+ * which is right for data entering the system but wrong for data already on disk: a single
+ * record written by an older version, hand-edited, or truncated mid-write made load() throw
+ * and took the whole session with it - every other message in the file became unreachable.
+ * Every read path therefore SKIPS a record it cannot hydrate and records why in a per-session
+ * quarantine list, readable via quarantined(). Consequences worth knowing:
+ * - get() returns null for a quarantined id, indistinguishable from a missing one except by
+ *   looking at quarantined().
+ * - getPath() skips the record but keeps walking the parentId chain, so a corrupt message in
+ *   the middle of a branch costs that one message, not the ancestors above it.
+ * - save() rewrites the file from the store it is given, so saving a session that has
+ *   quarantined records DROPS them. Check quarantined() before a load -> save cycle if the
+ *   raw lines matter.
  */
 class JsonlStorage implements CanStoreMessages
 {
     private const VERSION = 1;
 
-    /** @var array<string, array{file: string, leafId: ?MessageId, index: array<string, array>, labels: array<string, string>}> */
+    /** @var array<string, array{file: string, leafId: ?MessageId, index: array<string, array>, labels: array<string, string>, quarantine: array<string, string>}> */
     private array $sessions = [];
 
     public function __construct(
@@ -62,6 +94,7 @@ class JsonlStorage implements CanStoreMessages
             'leafId' => null,
             'index' => [],
             'labels' => [],
+            'quarantine' => [],
         ];
 
         return $id;
@@ -79,8 +112,13 @@ class JsonlStorage implements CanStoreMessages
 
         // Group messages by section
         $sectionMessages = [];
-        foreach ($this->sessions[$sessionKey]['index'] as $entry) {
+        foreach ($this->sessions[$sessionKey]['index'] as $key => $entry) {
             if ($entry['type'] !== 'message') {
+                continue;
+            }
+
+            $message = $this->hydrate($sessionKey, (string) $key, $entry);
+            if ($message === null) {
                 continue;
             }
 
@@ -88,7 +126,7 @@ class JsonlStorage implements CanStoreMessages
             if (!isset($sectionMessages[$sectionName])) {
                 $sectionMessages[$sectionName] = [];
             }
-            $sectionMessages[$sectionName][] = Message::fromArray($entry['data']);
+            $sectionMessages[$sectionName][] = $message;
         }
 
         // Build sections
@@ -100,6 +138,10 @@ class JsonlStorage implements CanStoreMessages
         return MessageStore::fromSections(...$sections);
     }
 
+    /**
+     * Replaces the session with exactly $store - see the class docblock for why that is
+     * the contract and when to use append() instead.
+     */
     #[\Override]
     public function save(MessageSessionId $sessionId, MessageStore $store): StoreMessagesResult {
         $startedAt = new DateTimeImmutable();
@@ -108,26 +150,27 @@ class JsonlStorage implements CanStoreMessages
         try {
             $this->ensureLoaded($sessionId);
             $previousLeafId = $this->sessions[$sessionKey]['leafId'];
-
-            // For JSONL, we rebuild the file from scratch
-            // In production, you might want incremental appends
             $file = $this->sessionFile($sessionId);
 
-            // Track existing messages for newMessages count
-            $existingIds = array_keys($this->sessions[$sessionKey]['index']);
+            // Keyed by id, not a list: the previous code asked in_array() once per message
+            // saved, which is quadratic in session length on a path that already has to
+            // touch every message.
+            $existingIds = $this->sessions[$sessionKey]['index'];
             $finalLeafId = $this->resolveLeafIdForSave($store, $previousLeafId);
 
-            // Write header
-            $header = [
-                'type' => 'session',
-                'version' => self::VERSION,
-                'id' => $sessionKey,
-                'createdAt' => $startedAt->format(DateTimeImmutable::ATOM),
-                'leafId' => $finalLeafId?->toString(),
+            // The whole file is buffered before anything is written. That is what makes the
+            // write atomic (one temp file, one rename) and what turns a per-message
+            // open+write+close into a single write.
+            $lines = [
+                json_encode([
+                    'type' => 'session',
+                    'version' => self::VERSION,
+                    'id' => $sessionKey,
+                    'createdAt' => $startedAt->format(DateTimeImmutable::ATOM),
+                    'leafId' => $finalLeafId?->toString(),
+                ]) . "\n",
             ];
-            file_put_contents($file, json_encode($header) . "\n");
 
-            // Write all messages
             $messagesStored = 0;
             $sectionsStored = 0;
             $newMessages = 0;
@@ -136,35 +179,34 @@ class JsonlStorage implements CanStoreMessages
                 $sectionsStored++;
                 foreach ($section->messages()->all() as $message) {
                     $messageId = $message->id()->toString();
-                    $entry = [
+                    $lines[] = json_encode([
                         'type' => 'message',
                         'id' => $messageId,
                         'parentId' => $message->parentId() !== null ? (string) $message->parentId() : null,
                         'section' => $section->name(),
                         'timestamp' => $message->createdAt->format(DateTimeImmutable::ATOM),
                         'data' => $message->toArray(),
-                    ];
-                    file_put_contents($file, json_encode($entry) . "\n", FILE_APPEND);
+                    ]) . "\n";
                     $messagesStored++;
 
-                    if (!in_array($messageId, $existingIds, true)) {
+                    if (!isset($existingIds[$messageId])) {
                         $newMessages++;
                     }
                 }
             }
 
-            // Write labels
             foreach ($this->sessions[$sessionKey]['labels'] as $messageId => $label) {
-                $entry = [
+                $lines[] = json_encode([
                     'type' => 'label',
                     'id' => Uuid::uuid4(),
                     'parentId' => $finalLeafId?->toString(),
                     'targetId' => $messageId,
                     'label' => $label,
                     'timestamp' => (new DateTimeImmutable())->format(DateTimeImmutable::ATOM),
-                ];
-                file_put_contents($file, json_encode($entry) . "\n", FILE_APPEND);
+                ]) . "\n";
             }
+
+            $this->writeAtomically($file, implode('', $lines));
 
             // Reload index
             $this->loadSession($sessionId);
@@ -239,7 +281,7 @@ class JsonlStorage implements CanStoreMessages
             return null;
         }
 
-        return Message::fromArray($entry['data']);
+        return $this->hydrate($sessionKey, $messageId->toString(), $entry);
     }
 
     #[\Override]
@@ -248,14 +290,17 @@ class JsonlStorage implements CanStoreMessages
         $sessionKey = $sessionId->toString();
 
         $messages = [];
-        foreach ($this->sessions[$sessionKey]['index'] as $entry) {
+        foreach ($this->sessions[$sessionKey]['index'] as $key => $entry) {
             if ($entry['type'] !== 'message') {
                 continue;
             }
             if (($entry['section'] ?? 'messages') !== $section) {
                 continue;
             }
-            $messages[] = Message::fromArray($entry['data']);
+            $message = $this->hydrate($sessionKey, (string) $key, $entry);
+            if ($message !== null) {
+                $messages[] = $message;
+            }
         }
 
         if ($limit !== null) {
@@ -299,14 +344,31 @@ class JsonlStorage implements CanStoreMessages
         // Walk up the parentId chain
         $path = [];
         $currentId = $targetId;
+        $visited = [];
 
         while ($currentId !== null) {
-            $entry = $this->sessions[$sessionKey]['index'][$currentId->toString()] ?? null;
+            $currentKey = $currentId->toString();
+            if (isset($visited[$currentKey])) {
+                // A parentId cycle (only reachable via a hand-built Message or a corrupted
+                // session file) would otherwise spin forever. getPath() is a read path, so a
+                // partial, root-first path is more useful here than throwing.
+                break;
+            }
+            $visited[$currentKey] = true;
+
+            $entry = $this->sessions[$sessionKey]['index'][$currentKey] ?? null;
             if ($entry === null || $entry['type'] !== 'message') {
                 break;
             }
-            array_unshift($path, Message::fromArray($entry['data']));
-            $currentId = isset($entry['parentId']) ? new MessageId($entry['parentId']) : null;
+            // A record that cannot be hydrated drops out of the path, but the walk continues:
+            // its ancestors are still readable and are more useful than an empty result.
+            $message = $this->hydrate($sessionKey, $currentKey, $entry);
+            if ($message !== null) {
+                array_unshift($path, $message);
+            }
+
+            $parentId = $entry['parentId'] ?? null;
+            $currentId = is_string($parentId) ? $this->toMessageId($parentId) : null;
         }
 
         return new Messages(...$path);
@@ -317,10 +379,15 @@ class JsonlStorage implements CanStoreMessages
         $this->ensureLoaded($sessionId);
         $sessionKey = $sessionId->toString();
 
+        if (!isset($this->sessions[$sessionKey]['index'][$fromMessageId->toString()])) {
+            throw new RuntimeException("Message not found: {$fromMessageId}");
+        }
+
         // Get path to fork point
         $path = $this->getPath($sessionId, $fromMessageId);
 
-        // Create new session
+        // Create new session (only after the fork point is confirmed to exist, so a
+        // rejected fork does not leave an orphan session file behind)
         $newSessionId = $this->createSession();
 
         // Copy messages
@@ -368,12 +435,116 @@ class JsonlStorage implements CanStoreMessages
         return $this->sessions[$sessionId->toString()]['labels'];
     }
 
+    // QUARANTINE ////////////////////////////////////////////
+
+    /**
+     * Records in this session that could not be turned back into Messages, keyed by the id
+     * the record carried, with the reason as the value. Reads skip these instead of failing,
+     * so this is the only way to see that a session file holds data this version cannot
+     * understand. Deliberately NOT on CanStoreMessages: it describes a file format, and
+     * InMemoryStorage holds live Message objects that cannot fail to hydrate.
+     *
+     * @return array<string, string> id => reason
+     */
+    public function quarantined(MessageSessionId $sessionId): array {
+        $this->ensureLoaded($sessionId);
+        return $this->sessions[$sessionId->toString()]['quarantine'];
+    }
+
     // HELPERS ///////////////////////////////////////////////
+
+    /**
+     * @param array<string, mixed> $entry
+     */
+    private function hydrate(string $sessionKey, string $messageKey, array $entry): ?Message {
+        $data = $entry['data'] ?? null;
+        if (!is_array($data)) {
+            $this->sessions[$sessionKey]['quarantine'][$messageKey] = 'Message record has no data payload';
+            return null;
+        }
+
+        try {
+            return Message::fromArray($data);
+        } catch (\Throwable $e) {
+            $this->sessions[$sessionKey]['quarantine'][$messageKey] = $e->getMessage();
+            return null;
+        }
+    }
+
+    private function toMessageId(string $value): ?MessageId {
+        try {
+            return new MessageId($value);
+        } catch (\Throwable) {
+            return null;
+        }
+    }
 
     private function sessionFile(MessageSessionId $sessionId): string {
         // Sanitize session ID for filename
         $safe = preg_replace('/[^a-zA-Z0-9_-]/', '_', $sessionId->toString());
         return "{$this->basePath}/{$safe}.jsonl";
+    }
+
+    /**
+     * Writes $contents to $file so that readers see either the old file or the new one and
+     * never a partial write. The temp file is created in the SAME directory on purpose:
+     * rename() is atomic only within a filesystem, so a system temp dir would silently
+     * degrade this to a copy. Anything that fails leaves the previous file in place.
+     *
+     * No locking. Two concurrent saves still resolve to whichever renamed last, and this
+     * storage is single-process in current usage; locking cannot be layered on rename()
+     * anyway (you cannot hold a lock on a file you are about to replace) and would need a
+     * sidecar lock file held across the whole read-modify-write.
+     *
+     * @throws RuntimeException if the temp file cannot be created, written, or moved
+     */
+    private function writeAtomically(string $file, string $contents): void {
+        // Not tempnam(): when the requested directory is not writable it silently falls back
+        // to the system temp dir, which puts the temp file on another filesystem and quietly
+        // turns the rename below into a non-atomic copy. Opening 'x' in the target directory
+        // instead keeps the file where it must be and fails loudly if it cannot.
+        $directory = dirname($file);
+        // Checked up front so the ordinary "directory is not writable" failure reports the
+        // directory instead of surfacing an fopen() warning naming a temp file the caller
+        // never asked for.
+        if (!is_writable($directory)) {
+            throw new RuntimeException("Cannot write session file - directory is not writable: {$directory}");
+        }
+
+        $temp = $file . '.tmp-' . bin2hex(random_bytes(8));
+        $handle = @fopen($temp, 'xb');
+        if ($handle === false) {
+            throw new RuntimeException("Cannot create a temporary session file in: {$directory}");
+        }
+
+        try {
+            if (@fwrite($handle, $contents) !== strlen($contents)) {
+                throw new RuntimeException("Cannot write session file: {$file}");
+            }
+            fclose($handle);
+            $handle = null;
+
+            // fopen() applies the umask, so the temp file already has the mode a fresh
+            // session file would get; an existing file's mode is preserved instead, so a
+            // save does not silently re-permission a session someone chmod'ed.
+            $mode = match (true) {
+                file_exists($file) => fileperms($file) & 0777,
+                default => null,
+            };
+            if ($mode !== null) {
+                @chmod($temp, $mode);
+            }
+
+            if (!@rename($temp, $file)) {
+                throw new RuntimeException("Cannot move session file into place: {$file}");
+            }
+        } catch (\Throwable $e) {
+            if ($handle !== null) {
+                fclose($handle);
+            }
+            @unlink($temp);
+            throw $e;
+        }
     }
 
     private function ensureLoaded(MessageSessionId $sessionId): void {
@@ -397,6 +568,7 @@ class JsonlStorage implements CanStoreMessages
             'leafId' => null,
             'index' => [],
             'labels' => [],
+            'quarantine' => [],
         ];
 
         // Parse JSONL file
@@ -415,7 +587,13 @@ class JsonlStorage implements CanStoreMessages
             }
 
             $entry = json_decode($line, true);
-            if ($entry === null) {
+            // A session file is append-only and may be truncated mid-write, hand-edited, or
+            // carry a record written by a newer version. Every line must therefore be proven
+            // to be a keyed entry with a type before any key is read: `$entry === null` alone
+            // let a scalar or a type-less object through and produced one "Undefined array
+            // key" warning per read below. Unrecognized lines are skipped, so an unknown
+            // record type from a future writer degrades to being ignored rather than fatal.
+            if (!is_array($entry) || !is_string($entry['type'] ?? null)) {
                 continue;
             }
 
@@ -423,15 +601,30 @@ class JsonlStorage implements CanStoreMessages
             if ($entry['type'] === 'session') {
                 $preferredLeafValue = $entry['leafId'] ?? null;
                 if (is_string($preferredLeafValue) && $preferredLeafValue !== '') {
-                    $preferredLeafId = new MessageId($preferredLeafValue);
+                    // A header naming an unparseable leaf falls back to "last message wins"
+                    // rather than making the session unopenable.
+                    $preferredLeafId = $this->toMessageId($preferredLeafValue);
                 }
                 continue;
             }
 
-            // Index messages
+            // Index messages. A message record without a usable id cannot be indexed or
+            // become the leaf, and would have reached MessageId with null.
             if ($entry['type'] === 'message') {
-                $this->sessions[$sessionKey]['index'][$entry['id']] = $entry;
-                $this->sessions[$sessionKey]['leafId'] = new MessageId($entry['id']);
+                $id = $entry['id'] ?? null;
+                if (!is_string($id) || $id === '') {
+                    continue;
+                }
+                // MessageId validates, and it validates here - before any message is
+                // hydrated - so an id that is not a UUID used to fail the whole session on
+                // open. Quarantine it and keep reading the rest of the file.
+                $messageId = $this->toMessageId($id);
+                if ($messageId === null) {
+                    $this->sessions[$sessionKey]['quarantine'][$id] = "Invalid message id at line {$lineNum}: {$id}";
+                    continue;
+                }
+                $this->sessions[$sessionKey]['index'][$id] = $entry;
+                $this->sessions[$sessionKey]['leafId'] = $messageId;
             }
 
             // Track labels

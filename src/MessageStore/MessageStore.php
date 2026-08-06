@@ -105,9 +105,9 @@ final readonly class MessageStore
      */
     public function select(string|array $sections = []) : MessageStore {
         $names = match (true) {
-            empty($sections) => [],
             is_string($sections) => [$sections],
-            is_array($sections) => $sections,
+            $sections === [] => [],
+            default => $sections,
         };
         return new MessageStore(
             sections: $this->sections->select($names),
@@ -148,13 +148,13 @@ final readonly class MessageStore
      */
     public function toArray() : array {
         return [
-            'sections' => array_map(
+            'sections' => array_values(array_map(
                 static fn(Section $section) => [
                     'name' => $section->name(),
                     'messages' => $section->messages()->toArray(),
                 ],
                 $this->sections->all(),
-            ),
+            )),
             'parameters' => $this->parameters->toArray(),
         ];
     }
